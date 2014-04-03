@@ -1,0 +1,1134 @@
+/* drivers/power/rk2918_battery.c
+ *
+ * battery detect driver for the rk2918 
+ *
+ * This software is licensed under the terms of the GNU General Public
+ * License version 2, as published by the Free Software Foundation, and
+ * may be copied, distributed, and modified under those terms.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ */
+/***************hjc**************/
+/***************hjc**************/
+/***************hjc**************/
+/***************hjc**************/
+#include <linux/module.h>
+#include <linux/err.h>
+#include <linux/platform_device.h>
+#include <linux/power_supply.h>
+#include <linux/regulator/consumer.h>
+#include <linux/types.h>
+#include <linux/pci.h>
+#include <linux/interrupt.h>
+#include <asm/io.h>
+#include <asm/mach-types.h>
+#include <asm/mach/arch.h>
+#include <asm/mach/map.h>
+#include <mach/gpio.h>
+#include <linux/adc.h>
+#include <mach/iomux.h>
+#include <mach/board.h>
+#include <linux/delay.h>
+#include <linux/ktime.h>
+#include <linux/fs.h>
+#include <linux/kernel.h>
+
+#include <linux/reboot.h>
+#include <linux/syscalls.h>
+#include <linux/slab.h>
+#if 0
+#define DBG(x...) printk(x);
+#else
+#define DBG(x...) 
+#endif
+
+int rk29_battery_dbg_level=0;
+int AdcTestCnt = 0;
+int discharge_test = 0;
+
+#if defined(CONFIG_MACH_RK29_MS1735) ||defined(CONFIG_MACH_RK29_ACH8)
+#define RK29_USB_CHARGER_SUPPORT
+#endif
+
+#define BATT_FILENAME "/data/bat_last_capacity.dat"
+#define BATT_FILENAME1 "/data/battery_bak.bat"
+
+#define POWER_ON_PIN RK29_PIN4_PA4
+
+#define BATT_NOMAL_VOL_VALUE 3800
+#define BATT_ZERO_VOL_VALUE 3490
+#define BATT_MAX_VOL_VALUE 4180
+#define CONFIG_A10 1
+
+
+/****************************以下参数根据电池属性测量得到*********************************/
+
+#define TIMER_MS_COUNTS                    50                 //定时器的长度，每隔50ms产生一个中断
+#define SLOPE_SECOND_COUNTS            15                 //统计电压斜率的时间间隔S
+
+#define DISCHARGE_0_10                       30
+#define DISCHARGE_MIN_SECOND          45                 //最短放电1 %时间
+#define DISCHARGE_MID_SECOND          90                
+#define DISCHARGE_MAX_SECOND         150
+#define CHARGE_MIN_SECOND                45                //低电量时，充电1%最短时间
+#define CHARGE_MID_SECOND                90                //中等电量时，充电1%最短时间
+#define CHARGE_MAX_SECOND               150               //电量高时，充电1%最短时间
+
+#define CHARGE_0_20                             30               //电量在0%-20%的范围内，变化1% 需要的时间S
+#define CHARGE_21_40        	   	        60
+#define CHARGE_41_50        		        90
+#define CHARGE_51_90        		       120
+#define CHARGE_91_100      		       150
+
+#define POWER_TEST					120
+
+
+#define CHARGE_FULL_DELAY_TIMES    10            //充电满检测防抖时间
+#define USBCHARGE_IDENTIFY_TIMES   5             //插入USB后，PC 识别检测时间
+
+/*********************不同状态下电量变化1%的采样点个数SAMPLES*************************/
+#define NUM_VOLTAGE_SAMPLE                            ((SLOPE_SECOND_COUNTS * 1000)/TIMER_MS_COUNTS)                       
+#define NUM_DISCHARGE_SAMPLE                        ((DISCHARGE_MIN_SECOND* 1000)/TIMER_MS_COUNTS)
+#define NUM_CHARGE_MIN_SAMPLE                      ((CHARGE_MIN_SECOND*1000)/TIMER_MS_COUNTS)
+#define NUM_CHARGE_MID_SAMPLE                      ((CHARGE_MID_SECOND*1000)/TIMER_MS_COUNTS)
+#define NUM_CHARGE_MAX_SAMPLE                      ((CHARGE_MAX_SECOND*1000)/TIMER_MS_COUNTS)
+#define NUM_CHARGE_FULL_DELAY_TIMES           ((CHARGE_FULL_DELAY_TIMES*1000)/TIMER_MS_COUNTS)
+#define NUM_USBCHARGE_IDENTIFY_TIMES          ((USBCHARGE_IDENTIFY_TIMES)*1000/TIMER_MS_COUNTS)
+#define NUM_DISCHARGE_0_10                              ((DISCHARGE_0_10)*1000/TIMER_MS_COUNTS)
+
+#define NUM_0_20SAMPLE                                       ((CHARGE_0_20 * 1000) /TIMER_MS_COUNTS)
+#define NUM_21_40SAMPLE                                     ((CHARGE_21_40 * 1000)/TIMER_MS_COUNTS)
+#define NUM_41_50SAMPLE                                     ((CHARGE_41_50 * 1000)/TIMER_MS_COUNTS)
+#define NUM_51_90SAMPLE                                     ((CHARGE_51_90 * 1000)/TIMER_MS_COUNTS)
+#define NUM_91_100SAMPLE                                   ((CHARGE_91_100* 1000)/TIMER_MS_COUNTS)
+
+#define NUM_POWER_TEST						    ((POWER_TEST) * 1000/TIMER_MS_COUNTS)
+/******************************和ADC模块相关数据**********************************/
+#define BAT_2V5_VALUE                        2500               //基准电压
+#define BAT_MAX_VOL_VALUE               4180               //满电时电压     (for A7)
+#define BAT_ZERO_VOL_VALUE              3500              //关机时电压
+#define BAT_NORMAL_VOL_VALUE         3800               //平常状态下电压
+
+/************定义ADC 采样分压电阻，以实际电路为准，单位K*************/
+#define BAT_PULL_UP_R             100
+#define BAT_PULL_DOWN_R        100
+
+#define BAT_ADC_TABLE_LEN     11
+
+static int adc_raw_table_bat[BAT_ADC_TABLE_LEN] = 
+{
+#if defined(CONFIG_A10)
+	    3490, 3536, 3570, 3600, 3626, 3669, 3738, 3804, 3866, 3962, 4080
+	//3500, 3566, 3610, 3629, 3656, 3689, 3734, 3804, 3866, 3962, 4070
+#elif defined(CONFIG_M908)
+	3450, 3510, 3547, 3565, 3590, 3620, 3666, 3739, 3803, 3865, 4090
+//	3450, 3510, 3547, 3565, 3590, 3620, 3666, 3739, 3803, 3894, 4090
+//	3370, 3475, 3547, 3565, 3590, 3620, 3666, 3739, 3803, 3894, 4100
+//	3420, 3495, 3547, 3565, 3590, 3620, 3666, 3739, 3803, 3894, 4100
+//3500, 3558, 3686, 3716, 3748, 3760, 3797, 3841, 3913, 3967, 4050
+#elif defined(CONFIG_MACH_RK29_ACH7)
+	3500, 3579, 3649, 3676, 3694, 3731, 3789, 3856, 3927, 4007, 4150
+#elif defined(CONFIG_MACH_RK29_ACH8)
+       3530, 3597, 3628, 3641, 3660, 3697, 3747, 3809, 3879, 3945, 4050
+#else
+       3500, 3579, 3649, 3676, 3694, 3731, 3789, 3856, 3927, 4007, 4150
+#endif
+};
+
+static int adc_raw_table_ac[BAT_ADC_TABLE_LEN] = 
+{
+#if defined(CONFIG_A10)
+	3610, 3714, 3758, 3788, 3832, 3876, 3915, 3994, 4047, 4111, 4160
+//   3610, 3774, 3808, 3828, 3852, 3886, 3935, 3994, 4047, 4121, 4160
+#elif defined(CONFIG_M908)
+	 3710, 3770, 3802, 3821, 3840, 3861, 3905, 3986, 4041, 4095, 4180
+//    3710, 3770, 3802, 3821, 3840, 3861, 3905, 3986, 4041, 4120, 4180
+//	3635, 3730, 3802, 3821, 3840, 3861, 3905, 3986, 4041, 4120, 4200
+//	3680, 3755, 3802, 3821, 3840, 3861, 3905, 3986, 4041, 4120, 4200
+//3600, 3776, 3850, 3885, 3910, 3927, 3960, 4000, 4077, 4114, 4150
+#elif defined(CONFIG_MACH_RK29_ACH7)
+	//3760, 3886, 3964, 3989, 4020, 4062, 4123, 4180, 4189, 4190, 4190      //实际测量值
+	3691, 3760, 3800, 3827, 3845, 3885, 3950, 4007, 4078, 4158, 4300//4185//4301
+#elif defined(CONFIG_MACH_RK29_ACH8)
+       3680, 3747, 3778, 3791, 3810, 3847, 3897, 3959, 4029, 4095, 4210//4185//4301
+#else
+       3691, 3760, 3800, 3827, 3845, 3885, 3950, 4007, 4078, 4158, 4300//4185//4301
+#endif
+};
+
+struct rk2918_battery_data{
+	int irq;
+	spinlock_t lock;
+
+	struct delayed_work work;
+	struct workqueue_struct *wq;
+	
+	struct work_struct timer_work;
+	struct timer_list timer;
+
+	struct power_supply battery;
+	struct power_supply ac;
+
+
+	int dc_det_pin;
+	int batt_low_pin;
+	int charge_ok_pin;
+	int charge_set_pin;;
+
+	int dc_det_level;
+	int batt_low_level;
+	int charge_ok_level;
+	int charge_set_level;
+
+	int dc_det_irq;
+
+	int adc_bat_divider;
+	int bat_max;
+	int bat_min;
+	int adc_val;
+
+	int full_times;
+
+	struct adc_client *client;
+};
+
+
+static struct rk2918_battery_data *gBatteryData;
+
+static int gBatStatus = POWER_SUPPLY_STATUS_UNKNOWN;
+static int gBatLastStatus = 0;
+static int gBatChargeStatus = 0;  //电池是否正在充电
+
+static int gBatHealth = POWER_SUPPLY_HEALTH_GOOD;
+static int gBatLastHealth = POWER_SUPPLY_HEALTH_UNKNOWN;
+
+static int gBatPresent = 1;
+static int gBatLastPresent=1;
+
+static int gBatCapacity = ((BATT_NOMAL_VOL_VALUE-BATT_ZERO_VOL_VALUE)*100/(BATT_MAX_VOL_VALUE-BATT_ZERO_VOL_VALUE));
+static int gBatLastCapacity = 0;                   
+
+static int gBatVoltage = BATT_NOMAL_VOL_VALUE;
+static int gBatLastVoltage = 0;
+
+static int gFirstReport = 1;
+static int gFirstFlag = 1;            //第一次启动标志
+static int gTrueCapacity = 0;     //实时电量值
+static int gAdcReadTmp = 0;       //实时读到的ADC值
+
+static int gBatCapacityUpCnt = NUM_CHARGE_MIN_SAMPLE;              //充电定时器
+static int gBatCapacityDownCnt = NUM_CHARGE_MIN_SAMPLE;          //放电定时器
+
+
+static int gBatVoltageSamples[NUM_VOLTAGE_SAMPLE+2];          //用于存储采样值，add 2 handle one bug
+static int *pSamples = &gBatVoltageSamples[0];           //采样点的指针指向存储电压值的数组
+static int gBatVoltageValue[2]={0,0};
+static int gFlagLoop = 0;                  //采样足够的标志
+s32 BatterySpendCnt = 0;              //记录启动时间
+
+static int gBatChargeErr = 0;          //获取ADC值避免跳动误差
+static int gBatChargeFullDelayTime = 0;
+extern int dwc_vbus_status(void);
+extern int get_msc_connect_flag(void);
+
+static int power_test=NUM_POWER_TEST;
+
+static int test_1=3;
+static int test_2=1;
+static int test_3=1;
+static int status_full_flag =1;
+
+static enum power_supply_property rk2918_battery_props[]={
+	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_HEALTH,
+	POWER_SUPPLY_PROP_PRESENT,
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_TECHNOLOGY,
+	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN,
+	POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
+};
+
+
+static enum power_supply_property rk2918_ac_props[]={
+	POWER_SUPPLY_PROP_ONLINE,
+};
+
+
+static int rk29_adc_read(int num)
+{
+	//同步读adc 
+	int i,temp=0;
+	for(i=0;i<num;i++){
+		temp += adc_sync_read(gBatteryData->client);
+	}
+	temp = temp/num;
+	return (temp * BAT_2V5_VALUE *(BAT_PULL_UP_R+BAT_PULL_DOWN_R))/(1024*BAT_PULL_DOWN_R);
+}
+
+static void rk2918_get_charge_status(void)
+{
+	//判断是否在充电，改变gBatChargeStatus
+	int charge_on = 0;
+
+	if(gBatteryData->dc_det_pin != INVALID_GPIO){
+		if(gpio_get_value(gBatteryData->dc_det_pin) == gBatteryData->dc_det_level){
+			charge_on = 1;
+		}
+	}
+	if(AdcTestCnt >= 39)
+		printk("dc_det_pin=%d,dc_det_level=%d\n",gpio_get_value(gBatteryData->dc_det_pin),gBatteryData->dc_det_level);
+	if(charge_on)
+		gBatChargeStatus = 1;
+	else{
+		gBatChargeStatus = 0;
+		gBatStatus = POWER_SUPPLY_STATUS_NOT_CHARGING;
+	}
+	
+}
+
+static int rk2918_get_bat_capacity_raw(int Batvoltage)
+{
+	//根据传进来的电压值Batvoltage和数组对比，由电压值得到对应的电量capacity
+	int *p;
+	int i,capacity;
+	
+	if((0 == gBatChargeStatus)||(4 == gBatStatus)){
+		p = &adc_raw_table_bat[0];
+	}
+	else
+		p = &adc_raw_table_ac[0];
+	if(Batvoltage <= p[0]) capacity = 0;
+	else if(Batvoltage >= p[BAT_ADC_TABLE_LEN-1]) capacity = 100;
+	else{
+		for(i = 0;i < BAT_ADC_TABLE_LEN;i++)
+		{
+			if((Batvoltage >= p[i])&&(Batvoltage < p[i+1])){
+				break;
+			}
+		}
+		capacity = i*10+((Batvoltage - p[i])*10) / (p[i+1] - p[i]);
+		}
+	//if(AdcTestCnt >= 30){
+	//	printk("capacity_raw,Batvoltage=%d,i=%d,p[i]=%d,p[i+1]=%d,capacity=%d\n",Batvoltage,i,p[i],p[i+1],capacity);
+	//}
+	return capacity;
+	
+}
+
+
+
+static void rk2918_get_bat_status(struct rk2918_battery_data *bat)
+{
+	//获得电池的状态
+	rk2918_get_charge_status();
+	//如果电量是满且还在充电中不改变状态直接返回
+	if((1 == gBatChargeStatus)&&(gBatStatus == POWER_SUPPLY_STATUS_FULL)){
+		//return;
+	};
+	if(AdcTestCnt >= 39)
+		printk("charge_ok_pin=%d,gBatChargeStatus=%d,gBatCapacity=%d,\n",gpio_get_value(gBatteryData->charge_ok_pin),gBatChargeStatus,gBatCapacity);
+	//接适配器	
+	if(1 == gBatChargeStatus){
+		if(gBatteryData ->charge_ok_pin == INVALID_GPIO){
+			printk("charge_ok_pin is invalid!\n");
+			return 0;
+		}
+		//电量满
+		if((gpio_get_value(gBatteryData->charge_ok_pin) == gBatteryData->charge_ok_level) && (gBatCapacity >= 99)){
+			if(gBatCapacityUpCnt == 0)
+				gBatStatus = POWER_SUPPLY_STATUS_FULL;
+			//	gBatCapacity = 100;
+		}
+		else{
+			gBatStatus= POWER_SUPPLY_STATUS_CHARGING;
+		}
+	}
+	//没接适配器
+	else{
+		gBatStatus= POWER_SUPPLY_STATUS_NOT_CHARGING;
+	}
+}
+
+static void rk2918_get_bat_voltage(struct rk2918_battery_data *bat)
+{
+	//获得当前的电压值
+	int i,value,num = 0;
+	int *pStart = &gBatVoltageSamples[0];
+	int temp=0;
+
+	value = gBatteryData->adc_val;
+	gAdcReadTmp = value;
+
+    	adc_async_read(gBatteryData->client);                      //异步读adc,回调函数值赋给value
+
+	*pSamples++ = (value * BAT_2V5_VALUE * (BAT_PULL_UP_R + BAT_PULL_DOWN_R)) / (1024 * BAT_PULL_DOWN_R);
+	num = pSamples -pStart;
+	if(num >= NUM_VOLTAGE_SAMPLE){
+		pSamples = pStart;
+		gFlagLoop = 1;
+	}
+	for(i=0;i<num;i++){
+		temp += gBatVoltageSamples[i];
+	}
+	gBatVoltage = temp / num;
+	
+	//消除毛刺电压
+	if(gBatVoltage >= BATT_MAX_VOL_VALUE+10)
+		gBatVoltage = BATT_MAX_VOL_VALUE+10;
+	if(gBatVoltage <= BATT_ZERO_VOL_VALUE-10)
+		gBatVoltage = BATT_ZERO_VOL_VALUE-10;
+		
+}
+
+static int rk2918_battery_load_get_capacity(void)
+{
+	//第一次启动时执行，从文件中读出的备份值和实际值比较确定capacity
+	int i;
+	int tmp = 0;
+	int loadcapacity = 0;
+	int truecapacity = 0;
+ 	char value[11];
+ 	char *p = value;
+ 	struct file *fp = filp_open(BATT_FILENAME,O_RDONLY,0);
+	tmp = rk29_adc_read(50);
+	truecapacity = rk2918_get_bat_capacity_raw(tmp);
+
+	if(IS_ERR(fp)){
+		printk("open file /data/bat_last_capacity.dat failed!\n");
+		printk("truecapacity= %d\n",truecapacity);
+		return truecapacity;
+	}
+
+	kernel_read(fp,0,value,10);
+	value[10]=0;
+
+	while(*p){
+		if(*p == 0x0d){
+			*p = 0;
+			break;
+		}
+		p++;
+	}
+	sscanf(value,"%d",&loadcapacity);
+
+	printk("hj-------------------loadcapacity=%d,truecapacity=%d\n",loadcapacity,truecapacity);
+#if 0
+	if(loadcapacity < truecapacity)            //关机期间进行了充电
+		loadcapacity = truecapacity;
+	else if(loadcapacity - truecapacity > 15)    //长久放置导致漏电
+		loadcapacity = truecapacity;
+	
+	if((loadcapacity == 0) //说明之前是没电关机
+		loadcapacity = 1;
+	else if((loadcapacity >= 100)||(gBatStatus == POWER_SUPPLY_STATUS_FULL))
+		loadcapacity = 100;
+	
+
+#endif
+//如果从文件中读取的电压比实际的高很多的话，说明是长时间放置导致放电
+	if (loadcapacity > truecapacity){
+	    if ((loadcapacity - truecapacity) > 15)
+	        loadcapacity = truecapacity;
+	}
+	else{
+		if (((truecapacity-loadcapacity) >= 20)){
+			if (truecapacity < 30){
+				if (loadcapacity < 10)
+					loadcapacity = truecapacity/2;
+			}
+			else{
+				if (truecapacity < 80)
+					loadcapacity = truecapacity - 2*(10 - truecapacity/10);	
+				else
+					loadcapacity = truecapacity;
+				}
+			}
+		}
+	if (loadcapacity == 0)
+		loadcapacity = 1;
+	else if ((loadcapacity >= 100)||(gBatStatus == POWER_SUPPLY_STATUS_FULL))
+		loadcapacity = 100;
+	 if((loadcapacity >= 100)&&(gBatStatus != POWER_SUPPLY_STATUS_FULL))  //add 0909
+		loadcapacity = 99;
+	return loadcapacity;
+		
+}
+
+static int rk2918_battery_resume_get_capacity(int deltatime)
+{
+	//待机唤醒后执行
+	int tmp = 0;
+	int capacity = 0;
+	
+	tmp = rk29_adc_read(20);
+	rk2918_get_charge_status;
+	capacity = rk2918_get_bat_capacity_raw(tmp);
+	//printk("%s,deltatime=%d,capacity=%d,gBatCapacity=%d,gBatChargeStatus=%d\n",__FUNCTION__,deltatime,capacity,gBatCapacity,gBatChargeStatus);
+	if(1 == gBatChargeStatus){
+		if(deltatime > (100-gBatCapacity)*CHARGE_MIN_SECOND)
+			deltatime = (100 - gBatCapacity)*CHARGE_MIN_SECOND;
+		if(capacity > gBatCapacity+(deltatime/CHARGE_MIN_SECOND))      //如果充电量比最大值还大
+			capacity = gBatCapacity+(deltatime / CHARGE_MIN_SECOND);//采样电池容量偏差较大，将容量拉回
+		else if(capacity < gBatCapacity)
+			capacity = gBatCapacity;	
+	}
+	else{
+		if(deltatime > gBatCapacity*DISCHARGE_MIN_SECOND)
+			deltatime = gBatCapacity*DISCHARGE_MIN_SECOND;
+		if(capacity < gBatCapacity-deltatime*DISCHARGE_MIN_SECOND)      //如果放电量比最小值还小
+			capacity = gBatCapacity - deltatime*DISCHARGE_MIN_SECOND;//采样电池容量偏差较大，将容量拉回
+		else if(capacity > gBatCapacity)
+			capacity = gBatCapacity;
+	}
+
+	if(capacity == 0) capacity = 1;
+	if((capacity == 100)&&(gBatStatus == POWER_SUPPLY_STATUS_FULL)) capacity=100;
+	else if((capacity == 100)&&(gBatStatus != POWER_SUPPLY_STATUS_FULL)) capacity = 99;
+	
+	return capacity;
+}
+
+static int rk2918_battery_get_capacity_ext(int gBatVoltage)
+{
+	//普通情况下执行
+	int capacity = 0;
+	//充电状态下电量满直接返回电量100 不继续执行下面的判断
+	if((1 == gBatChargeStatus)&&(gBatStatus == POWER_SUPPLY_STATUS_FULL)){
+		return 100;	
+	}
+	capacity = rk2918_get_bat_capacity_raw(gBatVoltage);
+	gTrueCapacity = capacity;
+	if(gBatChargeStatus == 1){
+		//充电状态下定时刷新
+		if((gBatCapacity >= 0)&&(gBatCapacity <= 90)){
+			if((capacity > gBatCapacity)&&(gBatCapacityUpCnt == 0)){
+					capacity = gBatCapacity +1;
+				 	//根据当前的电量值设置下一次更新电量的时间
+					if(capacity >90) gBatCapacityUpCnt = NUM_91_100SAMPLE;
+					else if(capacity >50)  gBatCapacityUpCnt = NUM_51_90SAMPLE;
+					else if(capacity > 40) gBatCapacityUpCnt = NUM_41_50SAMPLE;
+					else if(capacity > 20) gBatCapacityUpCnt = NUM_21_40SAMPLE;
+					else gBatCapacityUpCnt = NUM_0_20SAMPLE;
+			}
+			else if((capacity < gBatCapacity)||(gBatCapacityUpCnt != 0)){
+				capacity = gBatCapacity;
+			}
+		}
+		//电量值大于90后，采取模拟电量，固定时间(2.5min)升值1%
+		else if((gBatCapacity > 90)&&(gBatCapacity < 100)){	
+			if(gBatCapacityUpCnt == 0){
+			//if(((capacity >= gBatCapacity)&&(gBatCapacityUpCnt == 0))||(gBatCapacityUpCnt == 0)||((gBatCapacityUpCnt == 0)&&(gpio_get_value(gBatteryData->charge_ok_pin) == gBatteryData->charge_ok_level))){
+				capacity = gBatCapacity + 1;
+				gBatCapacityUpCnt = NUM_91_100SAMPLE;
+			}
+			else if((capacity < gBatCapacity)||(gBatCapacityUpCnt != 0)){
+				capacity = gBatCapacity;
+			}
+		}
+		else if(gBatCapacity == 100){
+			capacity = gBatCapacity;      //add an flag ?
+			status_full_flag = 0;
+		}
+		if(gBatCapacityUpCnt > 0) 
+			gBatCapacityUpCnt--;	
+
+		/*if(AdcTestCnt == 39){
+			printk("hjc---capacity=%d,gBatStatus=%d\n",capacity,gBatStatus);
+		}*/
+		if((capacity == 100)&&(gBatStatus == POWER_SUPPLY_STATUS_FULL)){
+			capacity = 100;	
+		}
+		else if((capacity == 100)&&(gBatStatus != POWER_SUPPLY_STATUS_FULL)&&(status_full_flag != 0)){
+			capacity = 99;
+		}
+	}
+	else{  //changed 9-7  else{
+		//非充电状态下定时刷新
+		 status_full_flag = 1;  //add 9-7
+		 if(rk29_battery_dbg_level){
+			if(++discharge_test >= 60){
+				printk("hjc-capacity=%d,gBatCapacity=%d,gBatCapacityDownCnt=%d\n",capacity,gBatCapacity,gBatCapacityDownCnt);
+				discharge_test = 0;
+			}	
+		 }
+		 if((capacity < gBatCapacity)&&(gBatCapacityDownCnt == 0)){
+			capacity = gBatCapacity-1;	
+			if(gBatCapacity > 10)
+				gBatCapacityDownCnt = NUM_CHARGE_MIN_SAMPLE;
+			else
+				gBatCapacityDownCnt = NUM_DISCHARGE_0_10;
+		 }
+		else{		
+			capacity = gBatCapacity;
+		}
+		if(gBatCapacityDownCnt > 0)
+			gBatCapacityDownCnt--;
+	}
+	
+
+	return capacity;
+}
+
+static void rk2918_get_bat_capacity(struct rk2918_battery_data *bat)
+{
+#if 0
+	//获得电池电量值
+	int deltatime = 0 ;
+	ktime_t ktimetmp;
+	ktimetmp = ktime_get_real();
+	deltatime = ktimetmp.tv.sec - BatterySpendCnt;
+
+	//第一次启动
+	if(gFirstFlag){
+		gFirstFlag--;
+		gBatCapacity = rk2918_battery_load_get_capacity();
+	}
+	//待机唤醒后
+	else if((deltatime > 30)&&(gFirstFlag == 0)){
+		//printk("in the else if,deltatime=%d,gFirstFlag=%d\n",deltatime,gFirstFlag);
+		gBatCapacity = rk2918_battery_resume_get_capacity(deltatime);
+	}
+	//按定时器每50 毫秒执行一次
+	else{
+		gBatCapacity = rk2918_battery_get_capacity_ext(gBatVoltage);	
+	}
+	
+	BatterySpendCnt = ktimetmp.tv.sec;
+
+#endif
+#if 1
+//for 3.0.8
+
+int deltatime = 0;
+struct timespec now;
+getnstimeofday(&now);
+deltatime = now.tv_sec-BatterySpendCnt;
+//printk("deltatime=%d,now.tv_sec=%d,BatterySpendCnt=%d\n",deltatime,now.tv_sec,BatterySpendCnt);
+//ktime_t ktimetmp;
+//ktimetmp = ktime_get_real();
+//deltatime = ktimetmp.tv.sec - BatterySpendCnt;
+//printk("%s,deltatime=%d,ktimetmp.tv.tv64=%d,BatterySpendCnt=%d\n",__FUNCTION__,deltatime,ktimetmp.tv.tv64,BatterySpendCnt);
+
+if(gFirstFlag){
+gFirstFlag--;
+gBatCapacity = rk2918_battery_load_get_capacity();
+}
+else if((deltatime > 30)&&(gFirstFlag == 0)){
+//printk("in the else if,deltatime=%d,gFirstFlag=%d\n",deltatime,gFirstFlag);
+gBatCapacity = rk2918_battery_resume_get_capacity(deltatime);
+}
+else{
+gBatCapacity = rk2918_battery_get_capacity_ext(gBatVoltage); 
+}
+
+//BatterySpendCnt = ktimetmp.tv.sec;
+
+BatterySpendCnt=now.tv_sec;
+
+#endif
+}
+
+
+static void rk2918_get_bat_health(struct rk2918_battery_data *bat)
+{
+	gBatHealth = POWER_SUPPLY_HEALTH_GOOD;
+}
+
+static void rk2918_get_bat_present(struct rk2918_battery_data *bat)
+{
+	if(gBatVoltage < bat->bat_min)
+		gBatPresent = 0;
+	else
+		gBatPresent = 1;
+}
+
+static int rk2918_ac_get_property(struct power_supply *psy,
+									   enum power_supply_property psp,
+									   union power_supply_propval *val)
+{
+	int ret = 0;
+	//charger_type_t charger;
+	//charger =  CHARGER_USB;
+/*	if(test_1 > 0){
+		test_1--;
+		printk("******rk2918_ac_get_property,capa=%d,lastcapa=%d,status=%d,laststatus=%d,present=%d,lastpresent=%d\n",gBatCapacity,gBatLastCapacity,gBatStatus,gBatLastStatus,gBatPresent,gBatLastPresent);
+	}*/
+	switch (psp) {
+	case POWER_SUPPLY_PROP_ONLINE:
+		if (psy->type == POWER_SUPPLY_TYPE_MAINS)
+		{
+			if (gBatChargeStatus == 1)
+				val->intval = 1;
+			else
+				val->intval = 0;	
+		}
+		DBG("%s:%d\n",__FUNCTION__,val->intval);
+		break;
+		
+	default:
+		ret = -EINVAL;
+		break;
+		}
+	return ret;
+}
+
+
+
+static int rk2918_battery_get_property(struct power_supply *psy,
+											enum power_supply_property psp,
+											union power_supply_propval *val)
+{
+/*	if(test_2 == 1){
+		test_2--;
+		printk("******rk2918_battery_get_property,capa=%d,lastcapa=%d,status=%d,laststatus=%d,present=%d,lastpresent=%d\n",gBatCapacity,gBatLastCapacity,gBatStatus,gBatLastStatus,gBatPresent,gBatLastPresent);
+	}*/
+	//printk("******rk2918_battery_get_property,capa=%d,lastcapa=%d,status=%d,laststatus=%d,present=%d,lastpresent=%d\n",gBatCapacity,gBatLastCapacity,gBatStatus,gBatLastStatus,gBatPresent,gBatLastPresent);
+	struct rk2918_battery_data *data = container_of(psy,
+		struct rk2918_battery_data, battery);
+	int ret = 0;
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_STATUS:
+		val->intval = gBatStatus;
+		DBG("gBatStatus=%d\n",val->intval);
+		break;
+	case POWER_SUPPLY_PROP_HEALTH:
+		val->intval = gBatHealth;
+		DBG("gBatHealth=%d\n",val->intval);
+		break;
+	case POWER_SUPPLY_PROP_PRESENT:
+		val->intval = gBatPresent;
+		DBG("gBatPresent=%d\n",val->intval);
+		break;
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+		if(gBatVoltageValue[1] == 0)
+		val ->intval = gBatVoltage;
+		else
+		val ->intval = gBatVoltageValue[1];
+		DBG("gBatVoltage=%d\n",val->intval);
+		break;
+	case POWER_SUPPLY_PROP_TECHNOLOGY:
+		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;	
+		break;
+	case POWER_SUPPLY_PROP_CAPACITY:
+		val->intval = gBatCapacity;
+		DBG("gBatCapacity=%d%%\n",val->intval);
+		break;
+	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
+		val->intval = data->bat_max;
+		break;
+	case POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN:
+		val->intval = data->bat_min;
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+
+	return ret;
+}
+
+ static void rk2918_battery_timer_work(struct work_struct * work)
+{
+	//定时器每50 ms执行一次，如果电池状态改变执行power_supply_changed()向用户层上报
+		if(test_3 == 1){
+		test_3--;
+		printk("*****rk2918_battery_timer_work,capa=%d,lastcapa=%d,status=%d,laststatus=%d,present=%d,lastpresent=%d\n",gBatCapacity,gBatLastCapacity,gBatStatus,gBatLastStatus,gBatPresent,gBatLastPresent);
+	}
+	//printk("*****rk2918_battery_timer_work,capa=%d,lastcapa=%d,status=%d,laststatus=%d,present=%d,lastpresent=%d\n",gBatCapacity,gBatLastCapacity,gBatStatus,gBatLastStatus,gBatPresent,gBatLastPresent);
+	rk2918_get_bat_status(gBatteryData);
+	rk2918_get_bat_health(gBatteryData);
+	rk2918_get_bat_present(gBatteryData);
+	rk2918_get_bat_voltage(gBatteryData);
+	rk2918_get_bat_capacity(gBatteryData);
+
+	if (rk29_battery_dbg_level)	{
+    		if (++AdcTestCnt >= 40){
+    	    		AdcTestCnt = 0;
+    	    		printk("gBatStatus=%d, adc_val = %lu, TrueBatVol = %lu,gBatVol = %d, gBatCap = %d,TrueCap = %d,sec = %d\n", 
+    	            	gBatStatus, gAdcReadTmp, ((gAdcReadTmp * BAT_2V5_VALUE * (BAT_PULL_UP_R + BAT_PULL_DOWN_R)) / (1024 * BAT_PULL_DOWN_R)), 
+    	            	gBatVoltage, gBatCapacity,gTrueCapacity,BatterySpendCnt);		
+    		}
+    	}
+
+	if(1 == gFirstReport){
+		power_supply_changed(&gBatteryData->battery);
+		printk("**************************gFirstReport**********************\n");
+		gFirstReport--;
+	}
+	if((gBatCapacity != gBatLastCapacity)||(gBatStatus != gBatLastStatus)||(gBatPresent != gBatLastPresent)){
+		//printk("capa=%d,lastcapa=%d,status=%d,laststatus=%d,present=%d,lastpresent=%d\n",gBatCapacity,gBatLastCapacity,gBatStatus,gBatLastStatus,gBatPresent,gBatLastPresent);
+		gBatLastCapacity = gBatCapacity;
+		gBatLastPresent = gBatPresent;
+		gBatLastStatus = gBatStatus;
+		
+		power_supply_changed(&gBatteryData->battery);
+		//power_supply_changed(&gBatteryData->ac);
+
+	}
+
+
+	
+}
+
+static void rk2918_batscan_timer(void)
+{
+	//定时器到,设置下一个定时器时间同时调度工作队列
+	//printk("**************%s*************\n",__FUNCTION__);
+	gBatteryData->timer.expires = jiffies + msecs_to_jiffies(TIMER_MS_COUNTS);
+	add_timer(&gBatteryData->timer);
+	schedule_work(&gBatteryData->timer_work);
+}
+
+
+static void rk2918_battery_work(struct work_struct *work)
+{
+	printk("**************%s*************\n",__FUNCTION__);
+ 	rk28_send_wakeup_key();
+	gBatChargeStatus = 1;
+	//rk2918_get_charge_status();//add by hjc for a10
+	enable_irq_wake(gBatteryData->dc_det_irq);
+}
+
+static int rk2918_dc_wakeup(int irq,void *dev_id)
+{
+	//提供电池充电后的中断函数
+	//disable_irq_wake(gBatteryData->dc_det_irq);
+	queue_delayed_work(gBatteryData->wq,&gBatteryData->work, 0);
+
+	return IRQ_HANDLED;
+}
+
+static void rk2918_low_battery_check(void)
+{
+	//驱动刚加载过程中的电量检测，如果电量低，10s内如果没有连接充电器自动关机
+	int i,tmp;
+	int gBatVoltaget;
+	int gBatCapacity;
+	
+	rk2918_get_charge_status();
+	gBatVoltaget = rk29_adc_read(100);
+	gBatCapacity = rk2918_get_bat_capacity_raw(gBatVoltaget);
+	printk("hjc-low_battery_check()----gBatVoltaget = %d,gBatCapacity=%d\n",gBatVoltaget,gBatCapacity);
+		
+	if (gBatVoltaget <= BATT_ZERO_VOL_VALUE-20){
+    	        printk("low battery: powerdown\n");
+       	 gpio_direction_output(POWER_ON_PIN, GPIO_LOW);
+    	        tmp = 0;
+       	 while(1) {
+          		 if(gpio_get_value(POWER_ON_PIN) == GPIO_HIGH){
+			 	gpio_set_value(POWER_ON_PIN,GPIO_LOW);
+		        }
+		        mdelay(5);
+		        if (++tmp > 50) break;
+		}
+	}
+	gpio_direction_output(POWER_ON_PIN, GPIO_HIGH);
+}
+
+static void rk2918_battery_callback(struct adc_client *client, void *param, int result)
+{	
+	//adc_async_read()函数的回调函数
+	gBatteryData->adc_val = result;
+	return;
+}
+///////for debug//////
+
+static ssize_t rk29_battery_dbg_show(struct class *cls, char *_buf)
+{
+    return sprintf(_buf, "%d\n", rk29_battery_dbg_level);
+}
+
+static ssize_t rk29_battery_dbg_store(struct class *cls, const char *_buf, size_t _count)
+{
+    rk29_battery_dbg_level = simple_strtoul(_buf, NULL, 16);
+    printk("rk29_battery_dbg_level = %d\n",rk29_battery_dbg_level);
+    
+    return _count;
+} 
+
+static struct class *rk29_battery_dbg_class = NULL;
+static CLASS_ATTR(rk29_battery_dbg, 0666, rk29_battery_dbg_show, rk29_battery_dbg_store);
+
+///////////for debug///////
+
+static int rk2918_battery_probe(struct platform_device *pdev)
+{
+	/*完成初始化*/
+	int ret;
+	struct adc_client *adc_client;                      //描述adc的结构体
+	struct rk2918_battery_data *data;      //电池的数据信息
+	struct rk2918_battery_platform_data *pdata = pdev->dev.platform_data;  //电池设备结构体的私有数据
+	int irq_flag;           //中断标志                     
+	data = kzalloc(sizeof(*data),GFP_KERNEL);
+	if(data == NULL){
+		ret = -ENOMEM;
+		goto err_data_alloc_failed;
+	}
+
+	data->dc_det_pin       = INVALID_GPIO;
+	data->batt_low_pin     = INVALID_GPIO;
+	data->charge_ok_pin  = INVALID_GPIO;
+	data->charge_set_pin = INVALID_GPIO;
+
+	if(pdata && pdata->io_init){
+		ret = pdata->io_init();
+		if(ret)
+			goto err_free_gpio1;
+	}
+
+	//dc dete
+	if(pdata->dc_det_pin != -INVALID_GPIO){
+		ret = gpio_request(pdata->dc_det_pin, NULL);
+		if(ret){
+			printk("faild to request dc_det gpio\n");
+			goto err_free_gpio1;
+		}
+		
+		gpio_pull_updown(pdata->dc_det_pin, GPIOPullUp); //m908 have to delete
+		//gpio_pull_updown(pdata->dc_det_pin, PullDisable);//for m908
+		ret = gpio_direction_input(pdata->dc_det_pin);
+		if(ret){
+			printk("faild to set gpio dc_det input\n");
+			goto err_free_gpio1;
+		}
+		data->dc_det_pin   = pdata->dc_det_pin;
+		data->dc_det_level = pdata->dc_det_level;     
+	}
+	
+	//charge ok
+	if(pdata->charge_ok_pin != -INVALID_GPIO){
+		ret = gpio_request(pdata->charge_ok_pin, NULL);
+		if(ret){
+			printk("faild to request charge_ok_bin/n");
+			goto err_free_gpio3;
+		}
+		gpio_pull_updown(pdata->charge_ok_pin, GPIOPullUp);
+		//gpio_pull_updown(pdata->charge_ok_pin, PullDisable);
+		ret = gpio_direction_input(pdata->charge_ok_pin);
+		if(ret){
+			printk("faild to set charge_ok_pin\n");
+			goto err_free_gpio3;
+		}
+		data->charge_ok_pin   = pdata->charge_ok_pin;
+		data->charge_ok_level = pdata->charge_ok_level;
+	}
+
+	adc_client = adc_register(0, rk2918_battery_callback, NULL);
+	if(NULL == adc_client){
+		goto err_adc_register_failed;
+	}
+	memset(gBatVoltageSamples,0,sizeof(gBatVoltageSamples));
+
+	spin_lock_init(&data->lock);
+	data->adc_val = adc_sync_read(adc_client);
+	data->client = adc_client;
+	data->battery.properties = rk2918_battery_props;
+	data->battery.num_properties = ARRAY_SIZE(rk2918_battery_props);
+	data->battery.get_property = rk2918_battery_get_property;
+	data->battery.name = "battery";
+	data->battery.type = POWER_SUPPLY_TYPE_BATTERY;
+	data->adc_bat_divider = 414;                                   
+	data->bat_max = BATT_MAX_VOL_VALUE;
+	data->bat_min = BATT_ZERO_VOL_VALUE;
+	DBG("bat_min = %d\n",data->bat_min);
+
+	data->ac.properties = rk2918_ac_props;
+	data->ac.num_properties = ARRAY_SIZE(rk2918_ac_props);
+	data->ac.get_property = rk2918_ac_get_property;
+	data->ac.name = "ac";
+	data->ac.type = POWER_SUPPLY_TYPE_MAINS;
+
+	
+	ret = power_supply_register(&pdev->dev, &data->ac);
+	if(ret){
+		printk(KERN_INFO "faild to register power_supply_ac\n");
+		goto err_ac_faild;
+	}
+
+	ret = power_supply_register(&pdev->dev,&data->battery);
+	if(ret){
+		printk(KERN_INFO "faild to register power_supply_batter\n");
+		goto err_battery_faild;
+	}
+	platform_set_drvdata(pdev,data);
+	//gBatteryData = data;   ///defined at hear ?
+
+	INIT_WORK(&data->timer_work,rk2918_battery_timer_work);
+	
+	if(pdata->dc_det_pin != INVALID_GPIO){
+		irq_flag = (!gpio_get_value(pdata->dc_det_pin))?IRQF_TRIGGER_RISING : IRQF_TRIGGER_FALLING;
+		ret = request_irq(gpio_to_irq(pdata->dc_det_pin), rk2918_dc_wakeup,irq_flag, "rk2918_battery",data);
+		if(ret){
+			printk("faild to request de_dev irq!\n");
+			goto err_dc_irq_failed;
+		}
+	data->dc_det_irq = gpio_to_irq(pdata->dc_det_pin);
+
+	data->wq = create_workqueue("rk2918_battery");
+	INIT_DELAYED_WORK(&data->work, rk2918_battery_work);
+	}
+
+	setup_timer(&data->timer,rk2918_batscan_timer,(unsigned long)data);
+	data->timer.expires = jiffies + 1000;
+	add_timer(&data->timer);
+
+	gBatteryData = data;
+	rk2918_low_battery_check();
+
+	    rk29_battery_dbg_class = class_create(THIS_MODULE, "rk29_battery");
+	class_create_file(rk29_battery_dbg_class,&class_attr_rk29_battery_dbg);
+
+	printk(KERN_INFO "rk2918_battery:driver initialized\n");
+	return 0;
+	
+err_dc_irq_failed:
+	free_irq(gpio_to_irq(pdata->dc_det_pin),data);
+err_data_alloc_failed:
+	kfree(data);
+	printk("rk2918_battery:error:\n");	
+err_free_gpio1:
+	kfree(&pdata->dc_det_pin);
+err_free_gpio2:
+	kfree(&pdata->charge_set_pin);
+err_free_gpio3:
+	kfree(&pdata->charge_ok_pin);
+err_adc_register_failed:
+err_ac_faild:
+	power_supply_unregister(&data->ac);
+err_battery_faild:
+	power_supply_unregister(&data->battery);
+
+	printk("rk2918_battery:error!\n");
+	return ret;
+	
+
+}
+
+#ifdef CONFIG_PM
+
+static int rk2918_battery_suspend(struct platform_device *pdev)
+{
+	/*挂起处于省电模式*/
+	flush_scheduled_work();
+	printk("hjc****************%s\n",__FUNCTION__);
+	return 0;
+}
+static int rk2918_battery_resume(struct platform_device *pdev)
+{
+	/*唤醒*/
+	schedule_work(&gBatteryData->timer_work);
+	printk("hjc****************%s\n",__FUNCTION__);
+	return 0;
+}
+#else
+#define rk2918_battery_suspend NULL
+#define rk2918_battery_resume NULL
+
+#endif
+
+
+static int rk2918_battery_remove(struct platform_device *pdev)
+{
+	/*移除设备*/
+	struct rk2918_battery_data *data = platform_get_drvdata(pdev);
+	struct rk2918_battery_platform_data *pdata = pdev->dev.platform_data;
+	printk("===================battery_remove=====================\n");
+	power_supply_unregister(&data->battery);
+	power_supply_unregister(&data->battery);
+
+	free_irq(gpio_to_irq(pdata->dc_det_pin),data);
+
+	gpio_free(pdata->charge_ok_pin);
+	gpio_free(pdata->dc_det_pin);
+	kfree(data);
+	gBatteryData = NULL;
+	return 0;
+
+}
+#if 0
+static void  rk2918_battery_shutdown(void)
+{
+	printk("************************************shutdown******************************************\n");
+ 	struct file *fp = filp_open(BATT_FILENAME,O_WRONLY|O_CREAT,0);
+//	struct file *fp = filp_open(BATT_FILENAME,O_RDONLY,0);
+	if(IS_ERR(fp)){
+		printk("..............open file /data/capacity_bak.dat failed!\n");
+		printk("gBatCapacity= %d\n",gBatCapacity);
+		return;
+	}
+	else
+	{
+		printk("open..........success\n");
+	}
+#if 0
+	int loadcapacity;
+	char buff[10];
+	char *p = buff;
+	
+	struct file *fp = filp_open(BATT_FILENAME,O_RDWR|O_CREAT,0);
+	sscanf(&gBatCapacity,"%s",buff);
+	//printk("-----------------------buff=%s----------\n",buff);
+	if(IS_ERR(fp)){
+		printk("open file /data/capacity_bak.dat failed!\n");
+		printk("gBatCapacity= %d\n",gBatCapacity);
+		return;
+	}
+	fp->f_op->write(fp, buff, sizeof(buff), 0);
+/*	//kernel_write(fp,buff, sizeof(buff),0);
+	//kernel_read(fp,0,buff,10);
+
+
+	while(*p){
+		if(*p == 0x0d){
+			*p = 0;
+			break;
+		}
+		p++;
+	}
+	sscanf(buff,"%d",&loadcapacity);
+
+	printk("******************hjc---,loadcapacity=%d,gBatCapacity = %d\n",loadcapacity,gBatCapacity);*/
+	filp_close(fp, NULL);
+	sys_sync();
+	
+#endif	
+}
+#endif
+static struct platform_driver rk2918_battery_driver={
+	.probe = rk2918_battery_probe,
+	.remove = rk2918_battery_remove,
+	.suspend = rk2918_battery_suspend,
+	.resume = rk2918_battery_resume,
+ //	.shutdown = rk2918_battery_shutdown,
+	.driver = {
+		.name = "rk2918-battery",
+		.owner = THIS_MODULE,
+		}
+};
+
+
+static int __init rk2918_battery_init(void)
+{
+	printk("%s\n",__FUNCTION__);
+	return platform_driver_register(&rk2918_battery_driver);
+}
+
+static void __exit rk2918_battery_exit(void)
+{	
+	printk("===================battery_exit=====================\n");
+	platform_driver_unregister(&rk2918_battery_driver);
+}
+
+module_init(rk2918_battery_init);
+module_exit(rk2918_battery_exit);
+
+MODULE_DESCRIPTION("driver for ach7 adc check for battery");
+MODULE_AUTHOR("hjc:hjc@rock-chips.com");
+MODULE_LICENSE("GPL");
+
